@@ -184,6 +184,7 @@ type Meteor = {
   active: boolean;
   hitApplied: boolean;
   radius: number;
+  leavesBurningFloor: boolean;
 };
 
 type BurningFloor = {
@@ -1846,27 +1847,24 @@ function getCurrentDevStageIndex() {
   return 0;
 }
 
+function applyDevSurvivalState(targetSurvival: number) {
+  const clampedSurvival = Math.max(0, targetSurvival);
+  let stageIndex = 0;
+
+  for (let index = devStageSnapshots.length - 1; index >= 0; index -= 1) {
+    if (clampedSurvival >= devStageSnapshots[index].survival) {
+      stageIndex = index;
+      break;
+    }
+  }
+
+  applyDevStage(stageIndex);
+  survivalWithoutDeath = clampedSurvival;
+  syncRunDollarsToSurvivalTime();
+}
+
 function stepDevStage(direction: -1 | 1) {
-  const currentStage = getCurrentDevStageIndex();
-  const lastStageIndex = devStageSnapshots.length - 1;
-  const lastStageSurvival = devStageSnapshots[lastStageIndex].survival;
-
-  if (direction > 0 && (currentStage === lastStageIndex || survivalWithoutDeath >= lastStageSurvival)) {
-    survivalWithoutDeath += 30;
-    syncRunDollarsToSurvivalTime();
-    ensureEnemyWavePresent();
-    return;
-  }
-
-  if (direction < 0 && currentStage === lastStageIndex && survivalWithoutDeath > lastStageSurvival) {
-    survivalWithoutDeath = Math.max(lastStageSurvival, survivalWithoutDeath - 30);
-    syncRunDollarsToSurvivalTime();
-    ensureEnemyWavePresent();
-    return;
-  }
-
-  const nextStage = clamp(currentStage + direction, 0, lastStageIndex);
-  applyDevStage(nextStage);
+  applyDevSurvivalState(survivalWithoutDeath + direction * 30);
 }
 
 function configureIronBoss(boss: Fighter) {
@@ -2008,7 +2006,44 @@ function intersectsWall(x: number, y: number, radius: number) {
   });
 }
 
-function canMoveTo(x: number, y: number, radius: number) {
+function shouldFightersCollide(a: Fighter, b: Fighter) {
+  if (a.id === b.id || !isFighterActive(a) || !isFighterActive(b)) {
+    return false;
+  }
+
+  if (a.team === "enemy" && b.team === "enemy") {
+    return false;
+  }
+
+  return true;
+}
+
+function intersectsBlockingFighter(x: number, y: number, radius: number, mover?: Fighter | null) {
+  return fighters.some((fighter) => {
+    if (!isFighterActive(fighter)) {
+      return false;
+    }
+
+    if (mover && !shouldFightersCollide(mover, fighter)) {
+      return false;
+    }
+
+    if (!mover && fighter.respawn > 0) {
+      return false;
+    }
+
+    const minDistance = radius + fighter.radius;
+    return Math.hypot(fighter.x - x, fighter.y - y) < minDistance;
+  });
+}
+
+function canMoveTo(
+  x: number,
+  y: number,
+  radius: number,
+  mover?: Fighter | null,
+  ignoreFighterCollisions = false
+) {
   if (bossFightStarted) {
     const arenaRadius = getBossArenaRadius();
     const dx = x - WORLD_WIDTH / 2;
@@ -2023,7 +2058,8 @@ function canMoveTo(x: number, y: number, radius: number) {
     x + radius < WORLD_WIDTH - 8 &&
     y - radius > 8 &&
     y + radius < WORLD_HEIGHT - 8 &&
-    !intersectsWall(x, y, radius)
+    !intersectsWall(x, y, radius) &&
+    (ignoreFighterCollisions || !intersectsBlockingFighter(x, y, radius, mover))
   );
 }
 
@@ -3356,7 +3392,8 @@ function spawnBossMeteorAt(x: number, y: number) {
     fallDuration: 0.34,
     active: false,
     hitApplied: false,
-    radius: 16
+    radius: 16,
+    leavesBurningFloor: false
   });
 }
 
@@ -3513,16 +3550,87 @@ function moveFighter(fighter: Fighter, dt: number) {
   const totalVy = fighter.vy + fighter.knockbackVy;
   const nextX = fighter.x + totalVx * dt;
   const nextY = fighter.y + totalVy * dt;
+  const ignoreFighterCollisions = fighter.isPlayer;
 
-  if (canMoveTo(nextX, fighter.y, fighter.radius)) {
+  if (canMoveTo(nextX, fighter.y, fighter.radius, fighter, ignoreFighterCollisions)) {
     fighter.x = nextX;
   } else {
     fighter.knockbackVx = 0;
   }
-  if (canMoveTo(fighter.x, nextY, fighter.radius)) {
+  if (canMoveTo(fighter.x, nextY, fighter.radius, fighter, ignoreFighterCollisions)) {
     fighter.y = nextY;
   } else {
     fighter.knockbackVy = 0;
+  }
+}
+
+function resolveFighterCollisions() {
+  const candidates = fighters.filter(isFighterActive);
+
+  function getCollisionResistance(fighter: Fighter) {
+    if (fighter.isBoss) {
+      return 9999;
+    }
+    if (fighter.isPlayer) {
+      return 8;
+    }
+    return 1;
+  }
+
+  for (let iteration = 0; iteration < 2; iteration += 1) {
+    for (let i = 0; i < candidates.length; i += 1) {
+      const a = candidates[i];
+      for (let j = i + 1; j < candidates.length; j += 1) {
+        const b = candidates[j];
+        if (!shouldFightersCollide(a, b)) {
+          continue;
+        }
+
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const distance = Math.hypot(dx, dy) || 0.001;
+        const minDistance = a.radius + b.radius;
+        if (distance >= minDistance) {
+          continue;
+        }
+
+        const overlap = minDistance - distance;
+        const normalX = dx / distance;
+        const normalY = dy / distance;
+        const aResistance = getCollisionResistance(a);
+        const bResistance = getCollisionResistance(b);
+        const totalResistance = aResistance + bResistance || 1;
+        const aMove = overlap * (bResistance / totalResistance);
+        const bMove = overlap * (aResistance / totalResistance);
+
+        const nextAX = a.x - normalX * aMove;
+        const nextAY = a.y - normalY * aMove;
+        const nextBX = b.x + normalX * bMove;
+        const nextBY = b.y + normalY * bMove;
+
+        const canMoveA = !a.isBoss && canMoveTo(nextAX, nextAY, a.radius, a);
+        const canMoveB = !b.isBoss && canMoveTo(nextBX, nextBY, b.radius, b);
+
+        if (canMoveA) {
+          a.x = nextAX;
+          a.y = nextAY;
+        }
+        if (canMoveB) {
+          b.x = nextBX;
+          b.y = nextBY;
+        }
+
+        if (!canMoveA && !canMoveB) {
+          if (!a.isBoss && canMoveTo(a.x - normalX * overlap, a.y - normalY * overlap, a.radius, a)) {
+            a.x -= normalX * overlap;
+            a.y -= normalY * overlap;
+          } else if (!b.isBoss && canMoveTo(b.x + normalX * overlap, b.y + normalY * overlap, b.radius, b)) {
+            b.x += normalX * overlap;
+            b.y += normalY * overlap;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -4554,7 +4662,8 @@ function spawnMeteor() {
     fallDuration: 0.34,
     active: false,
     hitApplied: false,
-    radius: 16
+    radius: 16,
+    leavesBurningFloor: true
   });
 }
 
@@ -4653,7 +4762,7 @@ function updateMeteors(dt: number, allowAutoSpawn = true) {
         }
       }
 
-      if (survivalWithoutDeath >= 60) {
+      if (meteor.leavesBurningFloor && survivalWithoutDeath >= 60) {
         spawnBurningFloor(meteor.x, meteor.y, meteor.radius);
       }
 
@@ -4745,6 +4854,7 @@ function update(dt: number) {
     }
   }
 
+  resolveFighterCollisions();
   updateCoopRevives(dt);
   updateBullets(dt);
   updateExplosions(dt);
